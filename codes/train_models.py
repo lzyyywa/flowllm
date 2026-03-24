@@ -151,7 +151,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 # = FlowComposer 插件逻辑 (100% 对齐论文) =
                 # ==========================================
                 if use_flow:
-                    outputs = model(batch_img, pairs=None, verb_labels=batch_verb, obj_labels=batch_obj)
+                    outputs = model(batch_img, pairs=train_pairs, verb_labels=batch_verb, obj_labels=batch_obj)
                     
                     # 1. Endpoint Classification Losses (代替原来的 vanilla CE)
                     loss_verb = Loss_fn(outputs['logits_v'], batch_verb)
