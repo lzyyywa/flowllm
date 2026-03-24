@@ -167,10 +167,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     
                     # 3. Explicit Composer Optimization (寻找最优合成组合权重 a*, b*)
                     with torch.no_grad():
-                        A = torch.stack([outputs["norm_v_v"], outputs["norm_v_o"]], dim=-1) # [B, D, 2]
-                        B_target = outputs["true_v_c"].unsqueeze(-1) # [B, D, 1]
+                        # 强制转换为 float32，既解决 AMP 类型不匹配问题，又保证最小二乘法的数值稳定性
+                        A = torch.stack([outputs["norm_v_v"], outputs["norm_v_o"]], dim=-1).float() # [B, D, 2]
+                        B_target = outputs["true_v_c"].unsqueeze(-1).float() # [B, D, 1]
+                        
                         coeffs_star = torch.linalg.lstsq(A, B_target).solution.squeeze(-1) # [B, 2]
-                        a_star, b_star = coeffs_star[:, 0:1], coeffs_star[:, 1:2]
+                        
+                        # 算完之后，将其 dtype 转回与模型预测值 pred_a 一致的类型，防止下面算 MSE 时再次报错
+                        a_star = coeffs_star[:, 0:1].to(outputs["pred_a"].dtype)
+                        b_star = coeffs_star[:, 1:2].to(outputs["pred_b"].dtype)
                     
                     loss_comp = F.mse_loss(outputs["pred_a"], a_star) + F.mse_loss(outputs["pred_b"], b_star)
                     
