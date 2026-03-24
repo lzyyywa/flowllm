@@ -168,15 +168,17 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                         
                         # 构建 A^T A 和 A^T B
                         A_t = A.transpose(-2, -1) # [B, 2, D]
-                        ATA = torch.bmm(A_t, A)   # [B, 2, 2]
-                        ATB = torch.bmm(A_t, B_target) # [B, 2, 1]
                         
-                        # 核心防爆机制：加入 L2 正则化项 (lambda * I)，根治奇异矩阵与共线性问题！
+                        # 【关键修复】在 bmm 算完之后，立刻强制转回 float()，对抗 AMP 的自动降级！
+                        ATA = torch.bmm(A_t, A).float()   
+                        ATB = torch.bmm(A_t, B_target).float() 
+                        
+                        # 核心防爆机制：加入 L2 正则化项 (lambda * I)
                         lambda_ridge = 0.1 
-                        I = torch.eye(2, device=A.device, dtype=A.dtype).unsqueeze(0)
+                        I = torch.eye(2, device=A.device, dtype=torch.float32).unsqueeze(0)
                         ATA_ridge = ATA + lambda_ridge * I
                         
-                        # 安全求解 (A^T A + \lambda I) X = A^T B
+                        # 绝对安全求解 (A^T A + \lambda I) X = A^T B
                         coeffs_star = torch.linalg.solve(ATA_ridge, ATB).squeeze(-1) # [B, 2]
                         
                         a_star = coeffs_star[:, 0:1].to(outputs["pred_a"].dtype)
