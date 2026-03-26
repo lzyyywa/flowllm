@@ -20,7 +20,7 @@ class FlowMLP(nn.Module):
         )
 
     def forward(self, x, t):
-        x_t = torch.cat([x, t], dim=-1) 
+        x_t = torch.cat([x, t], dim=-1)
         return self.net(x_t)
 
 class FlowComposer(nn.Module):
@@ -113,10 +113,10 @@ class TextEncoder(nn.Module):
             block.attn_mask = block.attn_mask[:cfg.ctx_length, :cfg.ctx_length]
         self.dtype = clip_model.dtype
 
-    def forward(self, x, tokenized_prompts): 
-        x = x.permute(1, 0, 2)  
+    def forward(self, x, tokenized_prompts):
+        x = x.permute(1, 0, 2)
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  
+        x = x.permute(1, 0, 2)
         x = self.ln_final(x)
 
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
@@ -191,11 +191,11 @@ class CustomCLIP(nn.Module):
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
         obj_text_features = self.c2c_text_o(obj_text_features)
 
-        video_features = self.video_encoder(video) 
+        video_features = self.video_encoder(video)
 
-        o_feat = self.c2c_OE1(video_features.mean(dim=-1))  
-        v_feat_t = self.c2c_VE1(video_features)             
-        v_feat = v_feat_t.mean(dim=-1)                      
+        o_feat = self.c2c_OE1(video_features.mean(dim=-1))
+        v_feat_t = self.c2c_VE1(video_features)
+        v_feat = v_feat_t.mean(dim=-1)
 
         if not self.use_flow:
             o_feat_normed = F.normalize(o_feat, dim=1)
@@ -214,8 +214,8 @@ class CustomCLIP(nn.Module):
             v_feat_c = self.c2c_VE2(video_features)
             v_feat_c = v_feat_c.mean(dim=-1)
             p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
-            p_pair_o = p_v_con_o * obj_logits.unsqueeze(1)  
-            p_pair_v = p_o_con_v * verb_logits.unsqueeze(-1)  
+            p_pair_o = p_v_con_o * obj_logits.unsqueeze(1)
+            p_pair_v = p_o_con_v * verb_logits.unsqueeze(-1)
 
             if self.training:
                 return verb_logits, obj_logits, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v
@@ -231,29 +231,27 @@ class CustomCLIP(nn.Module):
             B, D = v_feat.shape
             device = video.device
 
-            # 1. 基础特征提取与 L2 归一化 (全部保证 300 维)
+            # 1. 基础特征提取与 L2 归一化
             x0_v = F.normalize(v_feat, dim=-1)
             x0_o = F.normalize(o_feat, dim=-1)
-            
-            # 这里提取 c2c 的专属组合特征 (300维)
+
             o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
-            
-            # 【修复点 1 - 维度完美对齐】：使用投影后的 300 维特征相加作为起点！
+
             x0_c = F.normalize(v_feat_c + o_feat_c, dim=-1)
-            
+
             verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
             obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
 
             # -------------------------------------------------------------
-            # 🔥 主路：纯净 C2C 保底逻辑 (100% 原汁原味，防止地基坍塌)
+            # 🔥 主路：纯净 C2C 保底逻辑
             # -------------------------------------------------------------
             logits_v_base = x0_v @ verb_text_features_norm.t()
             logits_o_base = x0_o @ obj_text_features_norm.t()
-            
+
             logits_v_base = logits_v_base * 0.5 + 0.5
             logits_o_base = logits_o_base * 0.5 + 0.5
-            
+
             c = verb_text_features.shape[-1]
             n_v = logits_v_base.shape[-1]
             n_o = logits_o_base.shape[-1]
@@ -266,10 +264,7 @@ class CustomCLIP(nn.Module):
                 if verb_labels is None or obj_labels is None:
                     raise ValueError("Flow training requires `verb_labels` and `obj_labels`.")
 
-                # =============================================================
                 # 🛡️ 【神级防御：.detach() 单向玻璃墙】
-                # 切断 Flow 损失回传到视觉主干的通道，让 Flow 变聪明又不污染地基
-                # =============================================================
                 x0_v_f = x0_v.detach()
                 x0_o_f = x0_o.detach()
                 x0_c_f = x0_c.detach()
@@ -277,7 +272,7 @@ class CustomCLIP(nn.Module):
                 target_x1_v = verb_text_features_norm[verb_labels]
                 target_x1_o = obj_text_features_norm[obj_labels]
 
-                # --- 辅路 A：流匹配 MSE 轨迹训练 (使用 detach 后的特征) ---
+                # --- 辅路 A：流匹配 MSE 轨迹训练 ---
                 t = torch.rand(B, 1, device=device)
                 xt_v = (1 - t) * x0_v_f + t * target_x1_v
                 xt_o = (1 - t) * x0_o_f + t * target_x1_o
@@ -285,52 +280,56 @@ class CustomCLIP(nn.Module):
                 pred_v_v_t = self.v_flow(xt_v, t)
                 pred_v_o_t = self.o_flow(xt_o, t)
 
-                xt_v_leak = (1 - t) * x0_o_f + t * target_x1_v  
-                xt_o_leak = (1 - t) * x0_v_f + t * target_x1_o  
-                
+                xt_v_leak = (1 - t) * x0_o_f + t * target_x1_v
+                xt_o_leak = (1 - t) * x0_v_f + t * target_x1_o
+
                 pred_v_v_leak_t = self.v_flow(xt_v_leak, t)
                 pred_v_o_leak_t = self.o_flow(xt_o_leak, t)
 
-                # --- 辅路 B：FlowComposer 辅助打分 (使用 detach 后的特征) ---
+                # --- 辅路 B：FlowComposer 辅助打分 ---
                 t_zero = torch.zeros(B, 1, device=device)
                 pred_v_v_0 = self.v_flow(x0_v_f, t_zero)
                 pred_v_o_0 = self.o_flow(x0_o_f, t_zero)
-                
+
                 norm_v_v_0 = F.normalize(pred_v_v_0, dim=-1)
                 norm_v_o_0 = F.normalize(pred_v_o_0, dim=-1)
                 pred_a, pred_b = self.composer(norm_v_v_0, norm_v_o_0)
-                
+
                 pred_v_c_0 = pred_a * norm_v_v_0 + pred_b * norm_v_o_0
                 pred_x1_c_0 = x0_c_f + 1.0 * pred_v_c_0
-                
+
                 logits_c = None
+                logits_c_flow = None # 单独存放 Flow 的得分
+
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
-                    
+
                     c2c_graph_logits = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
 
                     pair_verb_text = verb_text_features_norm[train_v_inds]
                     pair_obj_text = obj_text_features_norm[train_o_inds]
                     train_pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
-                    
+
                     pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
                     flow_explicit_logits = pred_x1_c_norm @ train_pair_text_features.t()
                     flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
-                    
-                    # 【核心修复 3】：重新融合！因为有 .detach() 保护，CE Loss 会完美训练 Flow 的对比分辨能力
-                    logits_c = c2c_graph_logits + 0.5 * flow_explicit_logits
+
+                    # 【彻底分离】：将 C2C 地基分数和 Flow 对比分数单独输出，互不干扰！
+                    logits_c = c2c_graph_logits
+                    logits_c_flow = flow_explicit_logits
 
                 return {
-                    "logits_v": logits_v_base, 
-                    "logits_o": logits_o_base, 
+                    "logits_v": logits_v_base,
+                    "logits_o": logits_o_base,
                     "logits_c": logits_c,
+                    "logits_c_flow": logits_c_flow, # 独立返回供训练计算 Loss
                     
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
                     "true_v_v": target_x1_v - x0_v_f, "true_v_o": target_x1_o - x0_o_f,
                     "pred_v_v_leak": pred_v_v_leak_t, "pred_v_o_leak": pred_v_o_leak_t,
                     "true_v_v_leak": target_x1_v - x0_o_f, "true_v_o_leak": target_x1_o - x0_v_f,
                     "pred_a": pred_a, "pred_b": pred_b,
-                    "norm_v_v": norm_v_v_0, "norm_v_o": norm_v_o_0, 
+                    "norm_v_v": norm_v_v_0, "norm_v_o": norm_v_o_0,
                     "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c_f,
                     "logit_scale": self.logit_scale
                 }
@@ -338,31 +337,31 @@ class CustomCLIP(nn.Module):
             else:
                 # ====== 测试阶段 ======
                 t_zero = torch.zeros(B, 1, device=device)
-                
+
                 pred_v_v = self.v_flow(x0_v, t_zero)
                 pred_v_o = self.o_flow(x0_o, t_zero)
-                
+
                 norm_v_v = F.normalize(pred_v_v, dim=-1)
                 norm_v_o = F.normalize(pred_v_o, dim=-1)
                 pred_a, pred_b = self.composer(norm_v_v, norm_v_o)
-                
+
                 pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
                 pred_x1_c_0 = x0_c + 1.0 * pred_v_c
-                
+
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                
+
                 c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
-                
+
                 pair_verb_text = verb_text_features_norm[verb_idx]
                 pair_obj_text = obj_text_features_norm[obj_idx]
                 pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
-                
+
                 pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
                 flow_explicit_logits = pred_x1_c_norm @ pair_text_features.t()
                 flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
-                
+
                 com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
-                
+
                 return com_logits
 
     def condition_module(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
