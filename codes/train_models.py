@@ -130,6 +130,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         epoch_mse_losses = []
         epoch_comp_losses = []
+        epoch_com_flow_losses = [] # 用于专门记录 Flow 独立交叉熵 Loss
 
         use_flow = getattr(config, 'use_flow', False)
 
@@ -152,7 +153,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     # 1. Endpoint Classification Losses (保证乘以 cosine_scale 防止梯度消失)
                     loss_verb = Loss_fn(outputs['logits_v'] * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(outputs['logits_o'] * config.cosine_scale, batch_obj)
+                    
+                    # 纯净的 C2C 分类误差，夯实地基
                     loss_com = Loss_fn(outputs['logits_c'] * config.cosine_scale, batch_target)
+                    
+                    # 【核心解耦：单独让 Flow 网络学习对比误差】
+                    loss_com_flow = Loss_fn(outputs['logits_c_flow'] * config.cosine_scale, batch_target)
 
                     # 2. Primitive Flows MSE Losses
                     loss_mse_base = F.mse_loss(outputs["pred_v_v"], outputs["true_v_v"]) + \
@@ -190,10 +196,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     flow_weight = getattr(config, 'flow_loss_weight', 1.0)
                     comp_weight = getattr(config, 'composer_weight', 1.0)
 
-                    loss = loss_com + 0.2 * (loss_verb + loss_obj) + flow_weight * loss_mse_total + comp_weight * loss_comp
+                    # 【终极大一统 Loss：各司其职，互不污染！】
+                    loss = loss_com + 0.2 * (loss_verb + loss_obj) + flow_weight * loss_mse_total + comp_weight * loss_comp + 0.5 * loss_com_flow
 
                     mse_loss_val = loss_mse_total.item()
                     comp_loss_val = loss_comp.item()
+                    com_flow_loss_val = loss_com_flow.item()
 
                 # ==========================================
                 # = 原生 Vanilla 逻辑 =
@@ -211,6 +219,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                     mse_loss_val = 0.0
                     comp_loss_val = 0.0
+                    com_flow_loss_val = 0.0
 
                 loss = loss / config.gradient_accumulation_steps
 
@@ -230,28 +239,36 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             if use_flow:
                 epoch_mse_losses.append(mse_loss_val)
                 epoch_comp_losses.append(comp_loss_val)
+                epoch_com_flow_losses.append(com_flow_loss_val)
 
-            postfix_dict = {"train loss": np.mean(epoch_train_losses[-50:])}
+            # 在进度条上全面打印各项损失指标
+            postfix_dict = {
+                "train loss": np.mean(epoch_train_losses[-50:]),
+                "loss_v": np.mean(epoch_vv_losses[-50:]),
+                "loss_o": np.mean(epoch_oo_losses[-50:]),
+                "loss_com": np.mean(epoch_com_losses[-50:])
+            }
             if use_flow:
                 postfix_dict["flow_mse"] = np.mean(epoch_mse_losses[-50:])
                 postfix_dict["comp"] = np.mean(epoch_comp_losses[-50:])
+                postfix_dict["loss_flow_ce"] = np.mean(epoch_com_flow_losses[-50:])
             progress_bar.set_postfix(postfix_dict)
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
 
-        progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
-        train_losses.append(np.mean(epoch_train_losses))
-        log_training.write('\n')
-        log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
-        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
-        log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
-        log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
-
+        # 终端输出更加全面的训练概况
+        epoch_str = f"epoch {i + 1} train loss: {np.mean(epoch_train_losses):.4f}, loss_v: {np.mean(epoch_vv_losses):.4f}, loss_o: {np.mean(epoch_oo_losses):.4f}, loss_com: {np.mean(epoch_com_losses):.4f}"
         if use_flow:
-            log_training.write(f"epoch {i + 1} flow_mse loss {np.mean(epoch_mse_losses)}\n")
-            log_training.write(f"epoch {i + 1} composer loss {np.mean(epoch_comp_losses)}\n")
+            epoch_str += f", flow_mse: {np.mean(epoch_mse_losses):.4f}, comp: {np.mean(epoch_comp_losses):.4f}, flow_ce: {np.mean(epoch_com_flow_losses):.4f}"
+        
+        progress_bar.write(epoch_str)
+        train_losses.append(np.mean(epoch_train_losses))
+        
+        # 写入 txt 记录
+        log_training.write('\n')
+        log_training.write(f"{epoch_str}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
