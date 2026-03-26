@@ -231,21 +231,22 @@ class CustomCLIP(nn.Module):
             B, D = v_feat.shape
             device = video.device
 
-            # 1. 基础特征提取与 L2 归一化
+            # 1. 基础特征提取与 L2 归一化 (全部保证 300 维)
             x0_v = F.normalize(v_feat, dim=-1)
             x0_o = F.normalize(o_feat, dim=-1)
             
-            # 【核心优化】：使用全局平均视频特征作为组合起始点，而不是生硬的加法
-            x0_c = F.normalize(video_features.mean(dim=-1), dim=-1)
-            
+            # 这里提取 c2c 的专属组合特征 (300维)
             o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
+            
+            # 【修复点 1 - 维度完美对齐】：使用投影后的 300 维特征相加作为起点！
+            x0_c = F.normalize(v_feat_c + o_feat_c, dim=-1)
             
             verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
             obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
 
             # -------------------------------------------------------------
-            # 🔥 主路：纯净 C2C 保底逻辑 (算基础分，绝不让 Flow 污染底座)
+            # 🔥 主路：纯净 C2C 保底逻辑 (100% 原汁原味，防止地基坍塌)
             # -------------------------------------------------------------
             logits_v_base = x0_v @ verb_text_features_norm.t()
             logits_o_base = x0_o @ obj_text_features_norm.t()
@@ -266,8 +267,8 @@ class CustomCLIP(nn.Module):
                     raise ValueError("Flow training requires `verb_labels` and `obj_labels`.")
 
                 # =============================================================
-                # 🛡️ 【神级防御：.detach() 玻璃墙】
-                # 切断 Flow 损失回传到视觉主干的通道，彻底解耦两个任务
+                # 🛡️ 【神级防御：.detach() 单向玻璃墙】
+                # 切断 Flow 损失回传到视觉主干的通道，让 Flow 变聪明又不污染地基
                 # =============================================================
                 x0_v_f = x0_v.detach()
                 x0_o_f = x0_o.detach()
@@ -306,10 +307,8 @@ class CustomCLIP(nn.Module):
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     
-                    # 1. 拿回纯净版 C2C 的条件概率图得分
                     c2c_graph_logits = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
 
-                    # 2. 算出 FlowComposer 的空间测量得分
                     pair_verb_text = verb_text_features_norm[train_v_inds]
                     pair_obj_text = obj_text_features_norm[train_o_inds]
                     train_pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
@@ -318,35 +317,26 @@ class CustomCLIP(nn.Module):
                     flow_explicit_logits = pred_x1_c_norm @ train_pair_text_features.t()
                     flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
                     
-                    # 3. 完美结合！不仅融合打分，更让 CE 交叉熵损失教 Flow 学会“对比排斥”
-                    # 由于上面加了 .detach()，这里的 CE 损失绝不会向下毒害 C2C 的地基。
+                    # 【核心修复 3】：重新融合！因为有 .detach() 保护，CE Loss 会完美训练 Flow 的对比分辨能力
                     logits_c = c2c_graph_logits + 0.5 * flow_explicit_logits
 
                 return {
-                    # 基础分类损失 (指导底座)
                     "logits_v": logits_v_base, 
                     "logits_o": logits_o_base, 
-                    # 组合分类损失 (同时指导图网络 + Flow对比学习)
                     "logits_c": logits_c,
                     
-                    # 轨迹回归损失 (专门指导 Flow 网络)
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
                     "true_v_v": target_x1_v - x0_v_f, "true_v_o": target_x1_o - x0_o_f,
                     "pred_v_v_leak": pred_v_v_leak_t, "pred_v_o_leak": pred_v_o_leak_t,
                     "true_v_v_leak": target_x1_v - x0_o_f, "true_v_o_leak": target_x1_o - x0_v_f,
-                    
-                    # 比例合成器损失 (专门指导 Composer 网络)
                     "pred_a": pred_a, "pred_b": pred_b,
                     "norm_v_v": norm_v_v_0, "norm_v_o": norm_v_o_0, 
                     "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c_f,
-                    
                     "logit_scale": self.logit_scale
                 }
 
             else:
-                # -------------------------------------------------------------
-                # 🚀 推理阶段：双流完美联合预测
-                # -------------------------------------------------------------
+                # ====== 测试阶段 ======
                 t_zero = torch.zeros(B, 1, device=device)
                 
                 pred_v_v = self.v_flow(x0_v, t_zero)
@@ -361,10 +351,8 @@ class CustomCLIP(nn.Module):
                 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
                 
-                # 1. 基础 C2C 图得分 (保底常识)
                 c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
                 
-                # 2. FlowComposer 空间得分 (精准定位)
                 pair_verb_text = verb_text_features_norm[verb_idx]
                 pair_obj_text = obj_text_features_norm[obj_idx]
                 pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
@@ -373,7 +361,6 @@ class CustomCLIP(nn.Module):
                 flow_explicit_logits = pred_x1_c_norm @ pair_text_features.t()
                 flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
                 
-                # 3. 融合输出
                 com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
                 
                 return com_logits
