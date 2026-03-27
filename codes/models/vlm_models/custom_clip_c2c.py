@@ -66,7 +66,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.mod(x)
 
-
 class MLP_ST(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP_ST, self).__init__()
@@ -102,7 +101,6 @@ class MLP_ST(nn.Module):
                 x = o(x)
         return x
 
-
 class TextEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -122,7 +120,6 @@ class TextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
-
 class VideoEncoder(nn.Module):
     def __init__(self, cfg, clip_model):
         super().__init__()
@@ -137,7 +134,6 @@ class VideoEncoder(nn.Module):
             out = out @ self.clip_proj
         out = rearrange(out, '(b t) d -> b d t', t=self.num_frames)
         return out
-
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
@@ -169,49 +165,52 @@ class CustomCLIP(nn.Module):
         self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
                               dropout=False, norm=True, layers=layers)
 
-        self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
-        self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
-
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
+        self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
+        self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
+
         self.use_flow = getattr(cfg, 'use_flow', False)
         if self.use_flow:
-            self.v_flow = FlowMLP(cfg.emb_dim)
-            self.o_flow = FlowMLP(cfg.emb_dim)
-            self.composer = FlowComposer(cfg.emb_dim)
+            self.flow_v_proj = nn.Linear(cfg.emb_dim + cfg.feat_dim, cfg.feat_dim)
+            self.flow_o_proj = nn.Linear(cfg.emb_dim + cfg.feat_dim, cfg.feat_dim)
+            self.flow_c_proj = nn.Linear(cfg.feat_dim, cfg.feat_dim)
+            
+            self.v_flow = FlowMLP(cfg.feat_dim)
+            self.o_flow = FlowMLP(cfg.feat_dim)
+            self.composer = FlowComposer(cfg.feat_dim)
 
     def forward(self, video, pairs=None, verb_labels=None, obj_labels=None):
         verb_prompts = self.verb_prompt_learner()
-        verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts)
-        verb_text_features = self.c2c_text_v(verb_text_features)
-
+        raw_verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts) 
+        
         obj_prompts = self.obj_prompt_learner()
-        obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
-        obj_text_features = self.c2c_text_o(obj_text_features)
+        raw_obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts) 
 
-        video_features = self.video_encoder(video)
+        verb_text_features = self.c2c_text_v(raw_verb_text_features)
+        obj_text_features = self.c2c_text_o(raw_obj_text_features)
 
-        o_feat = self.c2c_OE1(video_features.mean(dim=-1))
+        video_features = self.video_encoder(video) 
+        vid_feat = video_features.mean(dim=-1)
+
+        o_feat = self.c2c_OE1(vid_feat) 
         v_feat_t = self.c2c_VE1(video_features)
-        v_feat = v_feat_t.mean(dim=-1)
+        v_feat = v_feat_t.mean(dim=-1) 
 
         if not self.use_flow:
             o_feat_normed = F.normalize(o_feat, dim=1)
             v_feat_normed = F.normalize(v_feat, dim=1)
             verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
             obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
-            verb_logits = v_feat_normed @ verb_text_features_norm.t()
-            obj_logits = o_feat_normed @ obj_text_features_norm.t()
-            verb_logits = verb_logits * 0.5 + 0.5
-            obj_logits = obj_logits * 0.5 + 0.5
+            verb_logits = v_feat_normed @ verb_text_features_norm.t() * 0.5 + 0.5
+            obj_logits = o_feat_normed @ obj_text_features_norm.t() * 0.5 + 0.5
             b = video_features.shape[0]
             c = verb_text_features.shape[-1]
             n_v = verb_logits.shape[-1]
             n_o = obj_logits.shape[-1]
-            o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
-            v_feat_c = self.c2c_VE2(video_features)
-            v_feat_c = v_feat_c.mean(dim=-1)
+            o_feat_c = self.c2c_OE2(vid_feat)
+            v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
             p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
             p_pair_o = p_v_con_o * obj_logits.unsqueeze(1)
             p_pair_v = p_o_con_v * verb_logits.unsqueeze(-1)
@@ -223,123 +222,144 @@ class CustomCLIP(nn.Module):
                 com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
                 return com_logits
 
-        # =========================================================
-        # === FlowComposer (Pure Flow + Composer, No Leakage) =====
-        # =========================================================
         else:
-            B, D = v_feat.shape
+            B = v_feat.shape[0]
             device = video.device
 
-            # L2 归一化的视觉起点和文本终点 (它们在超球面上)
-            x0_v = F.normalize(v_feat, dim=-1)
-            x0_o = F.normalize(o_feat, dim=-1)
+            x0_v_c2c = F.normalize(v_feat, dim=-1)
+            x0_o_c2c = F.normalize(o_feat, dim=-1)
+            verb_text_norm_c2c = F.normalize(verb_text_features, dim=-1)
+            obj_text_norm_c2c = F.normalize(obj_text_features, dim=-1)
 
-            o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
+            logits_v_base = x0_v_c2c @ verb_text_norm_c2c.t() * 0.5 + 0.5
+            logits_o_base = x0_o_c2c @ obj_text_norm_c2c.t() * 0.5 + 0.5
+
+            o_feat_c = self.c2c_OE2(vid_feat)
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
-            x0_c = F.normalize(v_feat_c + o_feat_c, dim=-1)
-
-            verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
-            obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
-
-            # --- C2C 原生图推演基线 ---
-            logits_v_base = x0_v @ verb_text_features_norm.t()
-            logits_o_base = x0_o @ obj_text_features_norm.t()
-            logits_v_base = logits_v_base * 0.5 + 0.5
-            logits_o_base = logits_o_base * 0.5 + 0.5
-
-            c = verb_text_features.shape[-1]
-            n_v = logits_v_base.shape[-1]
-            n_o = logits_o_base.shape[-1]
-
-            p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, B, c, n_v)
+            p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, logits_o_base.shape[-1], B, verb_text_features.shape[-1], logits_v_base.shape[-1])
             p_pair_o = p_v_con_o * logits_o_base.unsqueeze(1)
             p_pair_v = p_o_con_v * logits_v_base.unsqueeze(-1)
 
             if self.training:
-                if verb_labels is None or obj_labels is None:
-                    raise ValueError("Flow training requires `verb_labels` and `obj_labels`.")
+                v_feat_d = v_feat.detach()
+                o_feat_d = o_feat.detach()
+                vid_feat_d = vid_feat.detach()
+                
+                # 获取纯净且归一化后的文本基元，这是构建统一相加空间的基础
+                raw_v_text_d = raw_verb_text_features.detach()
+                raw_o_text_d = raw_obj_text_features.detach()
+                e_v = F.normalize(raw_v_text_d, dim=-1)
+                e_o = F.normalize(raw_o_text_d, dim=-1)
 
-                # 使用 .detach() 保护主干网络不被 Flow 产生的梯度干扰
-                x0_v_f = x0_v.detach()
-                x0_o_f = x0_o.detach()
-                x0_c_f = x0_c.detach()
+                v_cat_d = torch.cat([v_feat_d, vid_feat_d], dim=-1)
+                o_cat_d = torch.cat([o_feat_d, vid_feat_d], dim=-1)
 
-                target_x1_v = verb_text_features_norm[verb_labels]
-                target_x1_o = obj_text_features_norm[obj_labels]
+                x0_v_flow = F.normalize(self.flow_v_proj(v_cat_d), dim=-1)
+                x0_o_flow = F.normalize(self.flow_o_proj(o_cat_d), dim=-1)
+                x0_c_flow = F.normalize(self.flow_c_proj(vid_feat_d), dim=-1)
 
-                # --- Flow Matching 轨迹学习 (纯粹 MSE) ---
+                target_x1_v = e_v[verb_labels]
+                target_x1_o = e_o[obj_labels]
+
                 t = torch.rand(B, 1, device=device)
-                xt_v = (1 - t) * x0_v_f + t * target_x1_v
-                xt_o = (1 - t) * x0_o_f + t * target_x1_o
+                xt_v = (1 - t) * x0_v_flow + t * target_x1_v
+                xt_o = (1 - t) * x0_o_flow + t * target_x1_o
 
                 pred_v_v_t = self.v_flow(xt_v, t)
                 pred_v_o_t = self.o_flow(xt_o, t)
 
-                # --- 组合推演 Composer ---
                 t_zero = torch.zeros(B, 1, device=device)
-                pred_v_v_0 = self.v_flow(x0_v_f, t_zero)
-                pred_v_o_0 = self.o_flow(x0_o_f, t_zero)
+                pred_v_v_0 = self.v_flow(x0_v_flow, t_zero)
+                pred_v_o_0 = self.o_flow(x0_o_flow, t_zero)
 
-                # 输入给 Composer 时可以归一化以保证参数稳定
                 norm_v_v_in = F.normalize(pred_v_v_0, dim=-1)
                 norm_v_o_in = F.normalize(pred_v_o_0, dim=-1)
                 pred_a, pred_b = self.composer(norm_v_v_in, norm_v_o_in)
 
-                # 【核心】：使用“原始速度向量”(不归一化)按比例组合，保持几何长度的物理意义
                 pred_v_c_0 = pred_a * pred_v_v_0 + pred_b * pred_v_o_0
-                pred_x1_c_0 = x0_c_f + 1.0 * pred_v_c_0
+                
+                pred_x1_v = x0_v_flow + pred_v_v_0
+                pred_x1_o = x0_o_flow + pred_v_o_0
+                pred_x1_c_0 = x0_c_flow + 1.0 * pred_v_c_0
 
-                # 训练时，完全不用交叉熵惩罚 Flow 模块，让其纯净生长
                 logits_c = None
+                logits_v_flow = None
+                logits_o_flow = None
+                logits_c_flow = None
+                
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     logits_c = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
+
+                    logits_v_flow = F.normalize(pred_x1_v, dim=-1) @ e_v.t() * 0.5 + 0.5
+                    logits_o_flow = F.normalize(pred_x1_o, dim=-1) @ e_o.t() * 0.5 + 0.5
+
+                    # 【极微小瑕疵修复】这里统一使用归一化后的特征(e_v, e_o)相加，保证训练和推理标尺绝对一致！
+                    train_pair_text_features_raw = e_v[train_v_inds] + e_o[train_o_inds]
+                    logits_c_flow = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(train_pair_text_features_raw, dim=-1).t() * 0.5 + 0.5
+
+                target_x1_c = None
+                if verb_labels is not None and obj_labels is not None:
+                    # 同样，这里也是用 e_v + e_o，为 train_models.py 的 MSE 提供绝对精准的物理目标！
+                    target_x1_c = e_v[verb_labels] + e_o[obj_labels]
 
                 return {
                     "logits_v": logits_v_base,
                     "logits_o": logits_o_base,
                     "logits_c": logits_c,
+                    "logits_v_flow": logits_v_flow,
+                    "logits_o_flow": logits_o_flow,
+                    "logits_c_flow": logits_c_flow,
 
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
-                    # 真实速度 Target
-                    "true_v_v": target_x1_v - x0_v_f, "true_v_o": target_x1_o - x0_o_f,
+                    "true_v_v": target_x1_v - x0_v_flow, 
+                    "true_v_o": target_x1_o - x0_o_flow,
                     
                     "pred_a": pred_a, "pred_b": pred_b,
-                    # 输出原始速度给 train_models.py 做系数岭回归
                     "raw_v_v_0": pred_v_v_0, "raw_v_o_0": pred_v_o_0,
-                    # 组合特征的目标差向量
-                    "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c_f,
+                    
+                    "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c_flow, 
+                    "pred_x1_c_0": pred_x1_c_0,
+                    "target_x1_c": target_x1_c,
+                    
                     "logit_scale": self.logit_scale
                 }
 
             else:
-                # ====== 测试阶段 ======
+                # ====== 测试推断阶段 ======
                 t_zero = torch.zeros(B, 1, device=device)
 
-                pred_v_v = self.v_flow(x0_v, t_zero)
-                pred_v_o = self.o_flow(x0_o, t_zero)
+                v_cat = torch.cat([v_feat, vid_feat], dim=-1)
+                o_cat = torch.cat([o_feat, vid_feat], dim=-1)
+
+                x0_v_flow = F.normalize(self.flow_v_proj(v_cat), dim=-1)
+                x0_o_flow = F.normalize(self.flow_o_proj(o_cat), dim=-1)
+                x0_c_flow = F.normalize(self.flow_c_proj(vid_feat), dim=-1)
+
+                raw_verb_text_norm = F.normalize(raw_verb_text_features, dim=-1)
+                raw_obj_text_norm = F.normalize(raw_obj_text_features, dim=-1)
+
+                pred_v_v = self.v_flow(x0_v_flow, t_zero)
+                pred_v_o = self.o_flow(x0_o_flow, t_zero)
 
                 norm_v_v_in = F.normalize(pred_v_v, dim=-1)
                 norm_v_o_in = F.normalize(pred_v_o, dim=-1)
                 pred_a, pred_b = self.composer(norm_v_v_in, norm_v_o_in)
 
-                # 同样使用原始速度！
                 pred_v_c = pred_a * pred_v_v + pred_b * pred_v_o
-                pred_x1_c_0 = x0_c + 1.0 * pred_v_c
+                pred_x1_c_0 = x0_c_flow + 1.0 * pred_v_c
 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
+                
                 c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
 
-                pair_verb_text = verb_text_features_norm[verb_idx]
-                pair_obj_text = obj_text_features_norm[obj_idx]
-                pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
+                # 测试时用的也是归一化后特征的相加，和训练完全对齐了！
+                pair_verb_text_raw = raw_verb_text_norm[verb_idx]
+                pair_obj_text_raw = raw_obj_text_norm[obj_idx]
+                pair_text_features_raw = pair_verb_text_raw + pair_obj_text_raw
 
-                # 在距离空间对比推演结果和文本特征
-                pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
-                flow_explicit_logits = pred_x1_c_norm @ pair_text_features.t()
-                flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
+                flow_explicit_logits = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(pair_text_features_raw, dim=-1).t() * 0.5 + 0.5
 
-                # 强强联合推断
                 com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
 
                 return com_logits
