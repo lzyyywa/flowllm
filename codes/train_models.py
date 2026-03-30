@@ -88,21 +88,21 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     loss_obj = Loss_fn(outputs['logits_o'] * config.cosine_scale, batch_obj)
                     loss_com = Loss_fn(outputs['logits_c'] * config.cosine_scale, batch_target)
 
-                    # 最纯粹的基础交叉熵 Loss
+                    # 基础交叉熵 Loss
                     loss_v_flow = Loss_fn(outputs['logits_v_flow'] * config.cosine_scale, batch_verb)
                     loss_o_flow = Loss_fn(outputs['logits_o_flow'] * config.cosine_scale, batch_obj)
                     loss_c_flow = Loss_fn(outputs['logits_c_flow'] * config.cosine_scale, batch_target)
-                    
+
                     total_flow_ce = loss_v_flow + loss_o_flow + loss_c_flow
 
-                    # 最纯粹的单轨 MSE 损失
-                    loss_mse_total = F.mse_loss(outputs["pred_v_v"], outputs["true_v_v"]) + \
-                                     F.mse_loss(outputs["pred_v_o"], outputs["true_v_o"])
+                    # 【核心修复 1】：打破扁平化陷阱！使用 sum 恢复真实向量距离
+                    loss_mse_total = torch.mean(torch.sum((outputs["pred_v_v"] - outputs["true_v_v"])**2, dim=-1)) + \
+                                     torch.mean(torch.sum((outputs["pred_v_o"] - outputs["true_v_o"])**2, dim=-1))
 
                     with torch.no_grad():
-                        delta_v_t = F.normalize(outputs["raw_v_v_t"], dim=-1)
-                        delta_o_t = F.normalize(outputs["raw_v_o_t"], dim=-1)
-                        
+                        delta_v_t = F.normalize(outputs["raw_v_v_0"], dim=-1)
+                        delta_o_t = F.normalize(outputs["raw_v_o_0"], dim=-1)
+
                         A = torch.stack([delta_v_t, delta_o_t], dim=-1).float()
                         B_target = outputs["true_v_c"].unsqueeze(-1).float()
 
@@ -120,11 +120,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                     loss_comp = F.mse_loss(outputs["pred_a"], a_star) + F.mse_loss(outputs["pred_b"], b_star)
 
-                    # 保留神级 MSE，锁死发散
-                    loss_endpoint_mse = F.mse_loss(
-                        F.normalize(outputs["pred_x1_c_0"], dim=-1),
-                        F.normalize(outputs["target_x1_c"], dim=-1)
-                    )
+                    # 【核心修复 2】：终点 MSE 锁死，同样需要恢复量级！
+                    pred_x1_norm = F.normalize(outputs["pred_x1_c_0"], dim=-1)
+                    target_x1_norm = F.normalize(outputs["target_x1_c"], dim=-1)
+                    loss_endpoint_mse = torch.mean(torch.sum((pred_x1_norm - target_x1_norm)**2, dim=-1))
 
                     flow_weight = getattr(config, 'flow_loss_weight', 1.0)
                     comp_weight = getattr(config, 'composer_weight', 1.0)
@@ -162,7 +161,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             epoch_train_losses.append(loss.item())
             epoch_com_losses.append(loss_com.item())
-            
+
             if use_flow:
                 epoch_mse_losses.append(mse_loss_val)
                 epoch_comp_losses.append(comp_loss_val)
@@ -195,7 +194,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             for key in val_result:
                 if key in key_set: result = result + key + "  " + str(round(val_result[key], 4)) + "| "
             log_training.write(result + '\n')
-            
+
             if config.best_model_metric == "best_loss":
                 if loss_avg.cpu().float() < best_loss:
                     best_loss = loss_avg.cpu().float()
