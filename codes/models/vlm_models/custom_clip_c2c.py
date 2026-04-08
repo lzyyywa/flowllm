@@ -331,7 +331,9 @@ class CustomCLIP(nn.Module):
                 target_x1_seq = F.normalize(target_x1_seq, dim=-1)
 
                 t = torch.rand(B, 1, device=device)
-                t_seq = t.unsqueeze(1).unsqueeze(2) # [B, 1, 1] 广播给时间步和特征维
+                
+                # 🔥🔥🔥【已修复致命BUG】绝对正确的广播维度 [B, 1, 1]
+                t_seq = t.unsqueeze(-1) 
 
                 # 🔥 动词：集合到集合 (Set-to-Set 插值)
                 xt_v_seq = (1 - t_seq) * x0_v_flow_seq + t_seq * target_x1_seq
