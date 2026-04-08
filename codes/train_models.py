@@ -66,6 +66,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
     attr2idx = train_dataset.attr2idx
     obj2idx = train_dataset.obj2idx
+    # train_pairs 在训练的前向传播中不再需要传给 model
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj]) for attr, obj in train_dataset.train_pairs]).cuda()
 
     for i in range(config.epoch_start, config.epochs):
@@ -89,10 +90,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             with torch.cuda.amp.autocast(enabled=True):
                 if use_flow:
-                    # 🔥 核心：传入 labels 以便从 8步物理特征库提取 target_trajectory
-                    outputs = model(batch_img, pairs=train_pairs, verb_labels=batch_verb, obj_labels=batch_obj)
+                    # 🔥 关键修复：pairs=None 避开 DataParallel 分发错误，同时传入 labels 提取物理轨迹
+                    outputs = model(batch_img, pairs=None, verb_labels=batch_verb, obj_labels=batch_obj)
 
-                    # 1. 基础分类 Loss (C2C 基座)
+                    # 1. 基础分类 Loss
                     loss_verb = Loss_fn(outputs['logits_v'] * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(outputs['logits_o'] * config.cosine_scale, batch_obj)
                     
@@ -101,25 +102,19 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     else:
                         loss_com = torch.tensor(0.0).cuda()
 
-                    # 2. 🔥 时序轨迹流匹配 Loss (端到端监督)
-                    # 分别计算动词流、物品流、以及 Composer 融合流的轨迹误差
+                    # 2. 🔥 端到端轨迹对齐 Loss
                     loss_mse_v = F.mse_loss(outputs["pred_v_v_seq"], outputs["true_v_v_seq"])
                     loss_mse_o = F.mse_loss(outputs["pred_v_o_seq"], outputs["true_v_o_seq"])
-                    
-                    # Composer 的权重 pred_a, pred_b 会通过这个 loss 获得完美的梯度
                     loss_mse_c = F.mse_loss(outputs["pred_v_c_seq"], outputs["true_v_c_seq"])
                     
                     loss_mse_total = loss_mse_v + loss_mse_o + loss_mse_c
-
                     flow_weight = getattr(config, 'flow_loss_weight', 10.0) 
 
-                    # 总 Loss：移除旧版岭回归 Loss，拥抱端到端轨迹 Loss
                     loss = loss_com + 0.2 * (loss_verb + loss_obj) + flow_weight * loss_mse_total
-
                     mse_loss_val = loss_mse_total.item()
 
                 else:
-                    # 传统的 Vanilla C2C 逻辑
+                    # 原生 Vanilla 逻辑
                     p_v, p_o, p_pair_v, p_pair_o, _, _, _, _, _ = model(batch_img)
                     loss_verb = Loss_fn(p_v * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(p_o * config.cosine_scale, batch_obj)
@@ -164,9 +159,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         print(epoch_summary)
         log_training.write(epoch_summary + "\n")
 
-        # ==========================================
-        # 评估逻辑
-        # ==========================================
         val_start_thresh = getattr(config, 'val_epochs_ts', config.epochs + 1)
 
         if (i + 1 >= val_start_thresh) or (i % config.eval_every_n == 0) or (i + 1 == config.epochs):
