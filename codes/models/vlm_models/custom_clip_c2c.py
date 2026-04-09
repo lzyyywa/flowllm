@@ -9,16 +9,10 @@ import math
 
 _tokenizer = _Tokenizer()
 
-# ==========================================
-# 新增模块：时序流匹配专用网络
-# ==========================================
-
 class TimeEmbedding(nn.Module):
-    """标准的正弦波时间嵌入"""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-
     def forward(self, t):
         half_dim = self.dim // 2
         embeddings = math.log(10000) / (half_dim - 1)
@@ -30,7 +24,6 @@ class TimeEmbedding(nn.Module):
         return embeddings 
 
 class TemporalFlowNet(nn.Module):
-    """动词联合序列流网络"""
     def __init__(self, feature_dim, num_frames=8, num_layers=2, nhead=8):
         super(TemporalFlowNet, self).__init__()
         self.feature_dim = feature_dim
@@ -48,7 +41,6 @@ class TemporalFlowNet(nn.Module):
         self.velocity_head = nn.Sequential(
             nn.LayerNorm(feature_dim), nn.Linear(feature_dim, feature_dim)
         )
-
     def forward(self, x_seq, t):
         B, T, D = x_seq.shape
         t_emb = self.time_mlp(t) 
@@ -59,7 +51,6 @@ class TemporalFlowNet(nn.Module):
         return velocities
 
 class TemporalAttention(nn.Module):
-    """时序注意力"""
     def __init__(self, feature_dim):
         super(TemporalAttention, self).__init__()
         self.net = nn.Sequential(
@@ -69,9 +60,7 @@ class TemporalAttention(nn.Module):
     def forward(self, x):
         return self.net(x) 
 
-# 🔥 将 FlowMLP 升级为 PointToSetFlowMLP
 class PointToSetFlowMLP(nn.Module):
-    """物品点到集合流网络"""
     def __init__(self, feature_dim):
         super().__init__()
         self.net = nn.Sequential(
@@ -84,9 +73,6 @@ class PointToSetFlowMLP(nn.Module):
         x_t = torch.cat([x_seq, t_expand], dim=-1) 
         return self.net(x_t) 
 
-# ==========================================
-# 原有模块保留
-# ==========================================
 class FlowComposer(nn.Module):
     def __init__(self, feature_dim):
         super(FlowComposer, self).__init__()
@@ -211,9 +197,11 @@ class CustomCLIP(nn.Module):
             self.composer = FlowComposer(cfg.feat_dim)
             self.flow_temporal_attn = TemporalAttention(cfg.feat_dim)
 
-            # 🔥 加载轨迹特征
-            exact_feats = torch.load('./exact_8step_features.pt')
+            # 🔥 加载轨迹库，并利用数学均值提取解耦的 8帧动词 和 8帧物品
+            exact_feats = torch.load('./exact_8step_features.pt') # [V, O, 8, 512]
             self.register_buffer('exact_8step_traj', exact_feats)
+            self.register_buffer('verb_8step_traj', exact_feats.mean(dim=1)) # [V, 8, 512]
+            self.register_buffer('obj_8step_traj', exact_feats.mean(dim=0))  # [O, 8, 512]
 
     def forward(self, video, pairs=None, verb_labels=None, obj_labels=None):
         verb_prompts = self.verb_prompt_learner()
@@ -287,26 +275,30 @@ class CustomCLIP(nn.Module):
                 v_feat_seq_d = v_feat_seq_300.detach()
                 o_feat_d = o_feat.detach()
                 vid_feat_d = vid_feat_raw.detach()
-                raw_v_text_d = raw_verb_text_features.detach()
-                raw_o_text_d = raw_obj_text_features.detach()
-
+                
                 x0_v_flow_seq = F.normalize(self.flow_v_proj(v_feat_seq_d), dim=-1) 
                 x0_o_flow = F.normalize(self.flow_o_proj(o_feat_d), dim=-1)         
                 x0_c_flow = F.normalize(self.flow_c_proj(vid_feat_d), dim=-1)       
 
-                e_v = F.normalize(raw_v_text_d, dim=-1)
-                e_o = F.normalize(raw_o_text_d, dim=-1)
+                e_v = F.normalize(raw_verb_text_features.detach(), dim=-1)
+                e_o = F.normalize(raw_obj_text_features.detach(), dim=-1)
 
-                target_x1_seq = self.exact_8step_traj[verb_labels, obj_labels].to(device)
-                target_x1_seq = F.normalize(target_x1_seq, dim=-1)
+                # 🔥 落实你的原始 Idea：提取各自独立的 8 帧演化目标！
+                target_v_seq = F.normalize(self.verb_8step_traj[verb_labels].to(device), dim=-1) # [B, 8, 512]
+                target_o_seq = F.normalize(self.obj_8step_traj[obj_labels].to(device), dim=-1)   # [B, 8, 512]
+
+                # 最终 Composer 的监督目标依然是完整的组合轨迹
+                target_x1_seq = F.normalize(self.exact_8step_traj[verb_labels, obj_labels].to(device), dim=-1)
 
                 t = torch.rand(B, 1, device=device)
-                t_seq = t.unsqueeze(-1) # 修复广播
+                t_seq = t.unsqueeze(-1) # [B, 1, 1] 修复广播维度
 
-                xt_v_seq = (1 - t_seq) * x0_v_flow_seq + t_seq * target_x1_seq
+                # 🔥 动词的 Set-to-Set：视觉的 8 帧序列 -> 动词的 8 帧序列
+                xt_v_seq = (1 - t_seq) * x0_v_flow_seq + t_seq * target_v_seq
                 
+                # 🔥 物品的 Point-to-Set：视觉的 1 个点广播为 8 帧 -> 物品的 8 帧序列
                 x0_o_flow_broadcast = x0_o_flow.unsqueeze(1).expand(-1, T_frames, -1) 
-                xt_o_seq = (1 - t_seq) * x0_o_flow_broadcast + t_seq * target_x1_seq
+                xt_o_seq = (1 - t_seq) * x0_o_flow_broadcast + t_seq * target_o_seq
 
                 pred_v_v_t_seq = self.v_flow(xt_v_seq, t) 
                 pred_v_o_t_seq = self.o_flow(xt_o_seq, t) 
@@ -315,23 +307,23 @@ class CustomCLIP(nn.Module):
                 pred_v_o_t_point = torch.sum(attn_weights * pred_v_o_t_seq, dim=1) 
                 pred_a, pred_b = self.composer(pred_v_v_t_point, pred_v_o_t_point)
 
-                # 端到端 Composer 目标
-                true_v_v_seq = target_x1_seq - x0_v_flow_seq.detach()
-                true_v_o_seq = target_x1_seq - x0_o_flow_broadcast.detach()
+                # 监督目标：各找各的 8 帧独立目标
+                true_v_v_seq = target_v_seq - x0_v_flow_seq.detach()
+                true_v_o_seq = target_o_seq - x0_o_flow_broadcast.detach()
 
                 pred_v_c_seq = pred_a.unsqueeze(2) * pred_v_v_t_seq + pred_b.unsqueeze(2) * pred_v_o_t_seq
                 x0_c_flow_seq = x0_c_flow.unsqueeze(1).expand(-1, T_frames, -1)
+                
+                # Composer 指向 LLM 8 步组合轨迹
                 true_v_c_seq = target_x1_seq - x0_c_flow_seq.detach()
 
-                # 🔥 这里完全保留了你原来的 baseline loss 提取逻辑
                 logits_c, logits_v_flow, logits_o_flow, logits_c_flow = None, None, None, None
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     logits_c = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
                     
-                    # 为了让你原生 train_models 不报错，把这两个也算上
                     pred_x1_v = torch.sum(attn_weights * (xt_v_seq + (1 - t_seq) * pred_v_v_t_seq), dim=1)
-                    pred_x1_o = xt_o_seq[:, 0, :] + (1 - t) * pred_v_o_t_seq[:, 0, :] # 简化提取
+                    pred_x1_o = torch.mean(xt_o_seq + (1 - t_seq) * pred_v_o_t_seq, dim=1) 
                     logits_v_flow = F.normalize(pred_x1_v, dim=-1) @ e_v.t()
                     logits_o_flow = F.normalize(pred_x1_o, dim=-1) @ e_o.t()
                     
