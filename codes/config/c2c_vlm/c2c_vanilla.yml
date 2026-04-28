@@ -6,7 +6,8 @@ model:
   backbone: "ViT-B/32"
   use_flow: true            # 插件总开关 (true开启Flow匹配，false退回原生C2C)
   flow_step_size: 0.1       # 测试时的单步推理步长 h
-  flow_loss_weight: 1.0     # 流匹配 MSE 损失的权重
+  flow_loss_weight: 1.0   # 流匹配 MSE 损失的权重
+  flow_ce_weight: 0.5
   composer_weight: 1.0      # Composer 模块损失的权重
   temp: 0.07                # 温度系数 (用于端点分类损失计算)
 
