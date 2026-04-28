@@ -104,12 +104,14 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     loss_c_flow = Loss_fn(outputs['logits_c_flow'] * config.cosine_scale, batch_target)
                     total_flow_ce = loss_v_flow + loss_o_flow + loss_c_flow
 
-                    # ==========================================
-                    # 🔥 核心修改：接收带有容错机制的软对齐 Loss
-                    # ==========================================
-                    loss_mse_v = outputs["loss_soft_align_v"] # 替代原先的 F.mse_loss 强绑定
-                    loss_mse_o = F.mse_loss(outputs["pred_v_o"], outputs["true_v_o"]) # 物品端保持单点 MSE
-                    loss_mse_total = loss_mse_v + loss_mse_o
+                    # 🔥 [完美对接]：这里接收到的已经是 C2C 网络发来的最新“柔性对齐 MSE”啦！
+                    loss_mse_v = outputs["loss_soft_align_v"]
+                    loss_mse_o = outputs["loss_soft_align_o"]
+                    loss_mse_c = outputs["loss_soft_align_c"]
+                    loss_mse_total = loss_mse_v + loss_mse_o + loss_mse_c
+
+                    # 🔥 [完美对接]：提取终点锚定损失
+                    loss_endpoint_mse = outputs["loss_endpoint_mse"]
 
                     with torch.no_grad():
                         delta_v_0 = F.normalize(outputs["raw_v_v_0"], dim=-1)
@@ -128,14 +130,12 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                     loss_comp = F.mse_loss(outputs["pred_a"], a_star) + F.mse_loss(outputs["pred_b"], b_star)
 
-                    pred_x1_norm = F.normalize(outputs["pred_x1_c_0"], dim=-1)
-                    target_x1_norm = F.normalize(outputs["target_x1_c"], dim=-1)
-                    loss_endpoint_mse = F.mse_loss(pred_x1_norm, target_x1_norm)
-
+                    # 老老实实从 yml 配置文件读取权重，给出安全的 Fallback 默认值
                     flow_weight = getattr(config, 'flow_loss_weight', 1.0)
                     comp_weight = getattr(config, 'composer_weight', 1.0)
-                    flow_ce_weight = getattr(config, 'flow_ce_weight', 0.5)
+                    flow_ce_weight = getattr(config, 'flow_ce_weight', 0.8)
 
+                    # 🔥 [火力全开]：正确加入 1.0 * loss_endpoint_mse，锁死最终锚点！
                     loss = loss_com + 0.2 * (loss_verb + loss_obj) + \
                            flow_weight * loss_mse_total + comp_weight * loss_comp + \
                            flow_ce_weight * total_flow_ce + 1.0 * loss_endpoint_mse
@@ -208,14 +208,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(epoch_summary + "\n")
 
         # ==========================================
-        # 评估逻辑 (集成 val_epochs_ts 修复)
+        # 评估逻辑
         # ==========================================
         val_start_thresh = getattr(config, 'val_epochs_ts', config.epochs + 1)
 
-        # 满足以下任一条件即评估：
-        # 1. 当前 epoch 已经过了设定的阈值 (如 45)
-        # 2. 满足 eval_every_n 的频率要求
-        # 3. 最后一个 epoch
         if (i + 1 >= val_start_thresh) or (i % config.eval_every_n == 0) or (i + 1 == config.epochs):
             print("Evaluating val dataset:")
             loss_avg, val_result = evaluate(model, val_dataset, config)
