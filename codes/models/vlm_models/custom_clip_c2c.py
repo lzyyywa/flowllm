@@ -407,7 +407,7 @@ class CustomCLIP(nn.Module):
                 flow_explicit_logits = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(pair_text_features_raw, dim=-1).t() * 0.5 + 0.5
 
                 # 最终组合分：你可以根据需要在外部或这里微调 1.0 的比例 (比如 0.3, 0.4 等)
-                com_logits = c2c_graph_logits + 1.0 * flow_explicit_logits
+                com_logits = c2c_graph_logits + 3.0 * flow_explicit_logits
                 return com_logits
 
     def condition_module(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
